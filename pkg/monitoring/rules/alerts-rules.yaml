@@ -1,0 +1,39 @@
+groups:
+    - name: csi-volume-path-health
+      rules:
+        - alert: CSIVolumeMultipathDegraded
+          expr: |-
+            (
+              label_replace(
+                label_replace(
+                  kube_persistentvolume_info,
+                  "volume_handle", "$1", "csi_volume_handle", "(.+)"
+                )
+                * on(volume_handle) group_left(device, node, driver)
+                csi_volume_node_device_info,
+                "sysfs_name", "$1", "device", "(.*)"
+              )
+              * on(sysfs_name, node) group_left(device)
+              node_dmmultipath_device_info
+            )
+            * on(device, node) group_left()
+            (
+              count by(device, node) (node_dmmultipath_path_state{state!~"running|live"} == 1) > 0
+            )
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            description: At least one path to the multipath device is faulty. Investigate storage connectivity on node {{ $labels.node }}.
+            runbook_url: https://github.com/sradco/csi-volume-device-exporter/blob/main/docs/runbooks/CSIVolumeMultipathDegraded.md
+            summary: PV {{ $labels.persistentvolume }} on {{ $labels.node }} has degraded multipath (device {{ $labels.device }})
+        - alert: CSIVolumeDeviceExporterDown
+          expr: absent(up{job="csi-volume-device-exporter"}) == 1
+          for: 5m
+          labels:
+            operator_health_impact: warning
+            severity: warning
+          annotations:
+            description: No csi-volume-device-exporter targets have been scraped for 5 minutes. Storage path health for CSI volumes cannot be reported.
+            runbook_url: https://github.com/sradco/csi-volume-device-exporter/blob/main/docs/runbooks/CSIVolumeDeviceExporterDown.md
+            summary: CSI volume device exporter is not running
