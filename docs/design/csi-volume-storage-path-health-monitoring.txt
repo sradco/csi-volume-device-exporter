@@ -1,0 +1,135 @@
+CSI Volume Storage Path Health Monitoring for OpenShift Virtualization
+
+Author: Shirly Radco
+Date: May 2026
+Status: Draft
+
+
+1. Problem Statement
+
+When a storage path degrades on a node (e.g., a Fibre Channel link drops or an NVMe-oF controller dies), there is no way to identify which VMs are affected. Node-level storage health metrics exist, but they cannot be correlated to Kubernetes workloads. This leaves operators blind to the blast radius of storage path failures.
+
+
+2. Solution Overview
+
+Three new components close this gap:
+
+  1. node_exporter collectors — Expose DM-multipath and NVMe-oF path health per node by reading sysfs.
+  2. csi-volume-device-exporter — A DaemonSet that maps each CSI volume to its underlying block device.
+  3. PromQL alert joins — Correlate path health with PV identity to fire workload-aware alerts.
+
+Data flow:
+
+  kube_persistentvolume_info → csi_volume_node_device_info → node_dmmultipath_device_info → node_dmmultipath_path_state
+  Result: alert identifies which PV (and VM) is affected by a degraded path.
+
+
+3. Components
+
+3.1  prometheus/procfs (upstream PRs)
+
+  PR #796 — DM-Multipath sysfs parsing (reads /sys/block/dm-*)
+    https://github.com/prometheus/procfs/pull/796
+  PR #797 — NVMe-oF subsystem sysfs parsing (reads /sys/class/nvme-subsystem/)
+    https://github.com/prometheus/procfs/pull/797
+
+3.2  prometheus/node_exporter (upstream PRs)
+
+  PR #3581 — dmmultipath collector (disabled by default)
+    https://github.com/prometheus/node_exporter/pull/3581
+    Metrics: node_dmmultipath_path_state, node_dmmultipath_device_info, node_dmmultipath_device_paths_active/failed
+
+  PR #3579 — nvmesubsystem collector (disabled by default, stacked on #3581)
+    https://github.com/prometheus/node_exporter/pull/3579
+    Metrics: node_nvmesubsystem_path_state, node_nvmesubsystem_info, node_nvmesubsystem_paths_live
+
+  No special permissions required — reads only world-readable sysfs.
+
+3.3  csi-volume-device-exporter (new repo)
+
+  Repository: github.com/openshift-virtualization/csi-volume-device-exporter
+  (Currently at github.com/sradco/csi-volume-device-exporter)
+
+  Discovery: Reads kubelet vol_data.json + /proc/1/mountinfo. Also supports driver-specific JSON (Trident, HPE).
+
+  Primary metric:
+    csi_volume_node_device_info {node, volume_handle, driver, device}
+
+  Security: Non-privileged, read-only hostPath mounts, hostPID for mountinfo, UBI 9 Minimal base image, no K8s API access.
+
+  Alerts:
+    CSIVolumeMultipathDegraded — PV-backed multipath device has non-active paths (5m)
+    CSIVolumeNVMeSubsystemDegraded — PV-backed NVMe subsystem has dead controller paths (5m)
+    CSIVolumeDeviceExporterDown — Exporter not scraped for 5m
+
+3.4  HCO Integration
+
+  The exporter is deployed as an HCO-managed operand (like wasp-agent):
+    • Always-on, no feature gate
+    • Namespace: openshift-cnv
+    • Placement: spec.infra (all nodes, not just VM nodes)
+    • Image injected via CSI_VOLUME_DEVICE_EXPORTER_IMAGE env var
+    • Managed resources: DaemonSet, ServiceAccount, SCC, PodMonitor, PrometheusRule
+
+
+4. Alert PromQL
+
+CSIVolumeMultipathDegraded performs a three-way join:
+
+  Stage 1: kube_persistentvolume_info provides PV name and CSI volume handle
+  Stage 2: csi_volume_node_device_info maps volume_handle to block device (dm-5) on node
+  Stage 3: node_dmmultipath_device_info maps sysfs name (dm-5) to multipath device (mpathA)
+  Stage 4: node_dmmultipath_path_state detects paths with state not in (running, live)
+
+All metric sources must be scraped by the same Prometheus instance (platform monitoring in openshift-cnv).
+
+
+5. Storage Support Matrix
+
+Supported (works today):
+  DM-Multipath and NVMe-oF based storage — NetApp ONTAP, Dell PowerStore, HPE Alletra/3PAR, IBM FlashSystem, Pure FlashArray, Ceph RBD (multipath iSCSI/FC). Any CSI driver that uses kernel DM-multipath or NVMe-oF is automatically covered.
+
+Needs validation (likely works, untested):
+  OpenStack Cinder multipath — Cinder with multipath iSCSI/FC uses kernel DM-multipath, so the solution should work. Needs cluster testing to confirm. Priority: high (common in OpenShift on OpenStack deployments).
+
+Requires additional work:
+  1. Dell PowerFlex SDC — Volume-to-device mapping works, but path health is invisible. PowerFlex uses proprietary SDC-to-MDM connection management, not kernel multipath. Requires a powerflex_sdc_connected metric in the PowerFlex CSI driver. Priority: high (common in enterprise/telco).
+  2. NVMe-oF with ANA — Basic controller live/dead detection works. ANA (Asymmetric Namespace Access) group state reporting is missing — a "live" controller may be in a non-optimal ANA group. Requires procfs enhancement. Priority: low (NVMe-oF with ANA is still rare in production).
+
+Out of scope (no multipath concept):
+  CephFS, NFS — Network filesystems with no block device on the node. Path failures are a network connectivity issue.
+  Hostpath (HPP), Local PVs — Single direct-attached device, no redundant paths to monitor.
+  vSphere VMDK — Not relevant. Target audience is customers migrating away from VMware to OpenShift Virtualization, where VMs use real storage backends (Ceph, NetApp, Dell, etc.).
+
+
+6. Deployment
+
+OpenShift: HCO manages all resources in openshift-cnv. node_exporter collectors will be enabled by default via the cluster-monitoring-operator (request to OpenShift Monitoring team).
+
+Standalone Kubernetes: Manual kubectl apply from the deploy/ directory.
+
+
+7. Dependencies and Merge Order
+
+  1. procfs PRs #796, #797 (can merge in parallel)
+  2. node_exporter PR #3581, then #3579 (stacked)
+  3. csi-volume-device-exporter repo under openshift-virtualization
+  4. HCO integration PR
+  5. CMO collector enablement (separate request)
+
+
+8. Decisions
+
+  1. Repository lives under github.com/openshift-virtualization/
+  2. node_exporter collectors enabled by default in OpenShift via CMO
+  3. No HCO feature gate — always deployed
+  4. NVMe-oF alert will be added (CSIVolumeNVMeSubsystemDegraded)
+  5. Perses dashboard panel for storage path health per VM
+
+
+9. References
+
+  csi-volume-device-exporter: https://github.com/sradco/csi-volume-device-exporter
+  node_exporter PRs: #3581 (dmmultipath), #3579 (nvmesubsystem)
+  procfs PRs: #796 (DM-multipath), #797 (NVMe subsystem)
+  KubeVirt monitoring: https://github.com/kubevirt/kubevirt/tree/main/pkg/monitoring
